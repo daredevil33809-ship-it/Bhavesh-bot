@@ -2,44 +2,29 @@ import os
 import json
 import asyncio
 import time
-import platform
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict
 from collections import defaultdict
-
-# --- New Imports for Web Server ---
-from flask import Flask, request, abort
-# ----------------------------------
-
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from aiogram.enums import ParseMode
-from rapidfuzz import fuzz, process
+from rapidfuzz import fuzz
 from Levenshtein import distance as levenshtein_distance
+import requests 
+import threading 
+from flask import Flask, request, jsonify 
 
-# --- S3 Storage (kept intact) ---
-try:
-    from s3_storage import load_movies_from_s3, save_movies_to_s3
-    S3_ENABLED = True
-except ImportError:
-    S3_ENABLED = False
-    print("S3 storage not available (boto3 not installed or s3_storage.py missing)")
-    
-    def load_movies_from_s3():
-        return None
-    
-    def save_movies_to_s3(movies):
-        return False
-# --------------------------------
-
-# --- Environment Variables (Ensured all are checked) ---
+# --- Environment Variables and Configuration ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+APP_URL = os.getenv("APP_URL") 
+
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is not set")
 
-ADMIN_IDS = [7263519581]
+PING_INTERVAL_SECONDS = 300 
 
+ADMIN_IDS = [7263519581]
 LIBRARY_CHANNEL_USERNAME = "@MOVIEMAZA19"
 LIBRARY_CHANNEL_ID = -1002970735025
 JOIN_CHANNEL_USERNAME = "@MOVIEMAZASU"
@@ -47,7 +32,21 @@ JOIN_CHANNEL_ID = -1003124931164
 JOIN_GROUP_USERNAME = "@THEGREATMOVIESL9"
 JOIN_GROUP_ID = -1002970735025
 
-# --- File Paths (Kept intact) ---
+# S3 and File Handling Logic
+try:
+    from s3_storage import load_movies_from_s3, save_movies_to_s3
+    S3_ENABLED = True
+except ImportError:
+    S3_ENABLED = False
+    
+    def load_movies_from_s3():
+        return None
+    
+    def save_movies_to_s3(movies):
+        return False
+
+# File Paths 
+import platform
 if platform.system() == "Linux" and os.path.exists("/tmp"):
     MOVIES_FILE = "/tmp/movies.json"
     BACKUP_FILE = "/tmp/movies_backup.json"
@@ -58,14 +57,11 @@ else:
     BACKUP_FILE = "movies_backup.json"
     USERS_FILE = "users.json"
     INITIAL_DATA_FILE = None
-# --------------------------------
 
-# --- Bot and Dispatcher Setup ---
-bot = Bot(token=BOT_TOKEN)
+# --- Global State and Cache ---
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
-# --------------------------------
 
-# --- Global State and Cache (Kept intact) ---
 movies_cache: List[Dict[str, str]] = []
 movies_index: Dict[str, List[int]] = {}
 user_sessions: Dict[int, Dict] = defaultdict(dict)
@@ -79,20 +75,8 @@ bot_stats = {
     "cache_hits": 0
 }
 RATE_LIMIT_SECONDS = 1
-# ----------------------------------------------
 
-# --- Data Loading/Saving and Utility Functions (Kept intact) ---
-# build_movies_index, load_movies, save_movies, load_users, save_users, add_user, 
-# add_movie, normalize_abbreviations, phonetic_similarity, advanced_phonetic_match, 
-# check_rate_limit, check_user_membership, advanced_fuzzy_search (All original)
-# ... (All original functions go here) ...
-# Due to length constraints, the original function bodies are assumed to be included here.
-# -------------------------------------------------------------
-
-# NOTE: Original functions (build_movies_index, load_movies, save_movies, load_users, 
-# save_users, add_user, add_movie, normalize_abbreviations, phonetic_similarity, 
-# advanced_phonetic_match, check_rate_limit, check_user_membership, advanced_fuzzy_search) 
-# must be placed here exactly as they were in the original code.
+# --- Utility Functions ---
 
 def build_movies_index():
     global movies_index
@@ -114,8 +98,11 @@ def load_movies():
         s3_movies = load_movies_from_s3()
         if s3_movies is not None:
             movies_cache = s3_movies
-            with open(MOVIES_FILE, 'w', encoding='utf-8') as f:
-                json.dump(movies_cache, f, ensure_ascii=False, separators=(',', ':'))
+            try:
+                with open(MOVIES_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(movies_cache, f, ensure_ascii=False, separators=(',', ':'))
+            except Exception as e:
+                print(f"Error saving S3 data locally: {e}")
             build_movies_index()
             return
     
@@ -315,22 +302,6 @@ def check_rate_limit(user_id: int) -> bool:
     return True
 
 
-async def check_user_membership(user_id: int) -> bool:
-    if user_id in verified_users:
-        return True
-    
-    try:
-        channel_member = await bot.get_chat_member(JOIN_CHANNEL_ID, user_id)
-        group_member = await bot.get_chat_member(JOIN_GROUP_ID, user_id)
-        
-        if channel_member.status not in ['left', 'kicked'] and group_member.status not in ['left', 'kicked']:
-            verified_users.add(user_id)
-            return True
-    except Exception as e:
-        print(f"Error checking membership for user {user_id}: {e}")
-    
-    return False
-
 def advanced_fuzzy_search(query: str, limit: int = 15) -> List[Dict]:
     if not query or not movies_cache:
         return []
@@ -351,17 +322,14 @@ def advanced_fuzzy_search(query: str, limit: int = 15) -> List[Dict]:
         title = movie['title']
         title_lower = title.lower()
         title_normalized = normalize_abbreviations(title_lower)
-        title_words = title_normalized.split()
         
-        exact_match = title_normalized == query_normalized
-        starts_with = title_normalized.startswith(query_normalized)
-        contains = query_normalized in title_normalized
-        
+        # Scoring logic
         ratio_score = fuzz.ratio(query_normalized, title_normalized)
         partial_ratio = fuzz.partial_ratio(query_normalized, title_normalized)
         token_sort = fuzz.token_sort_ratio(query_normalized, title_normalized)
         token_set = fuzz.token_set_ratio(query_normalized, title_normalized)
         
+        title_words = title_normalized.split()
         word_match_score = 0
         if query_words and title_words:
             matched_words = sum(1 for qw in query_words if any(fuzz.partial_ratio(qw, tw) > 75 for tw in title_words))
@@ -369,10 +337,6 @@ def advanced_fuzzy_search(query: str, limit: int = 15) -> List[Dict]:
         
         phonetic_score = phonetic_similarity(query_normalized, title_normalized)
         adv_phonetic = advanced_phonetic_match(query_normalized, title_normalized)
-        
-        lev_dist = levenshtein_distance(query_normalized, title_normalized)
-        max_len = max(len(query_normalized), len(title_normalized))
-        lev_score = ((max_len - lev_dist) / max_len) * 100 if max_len > 0 else 0
         
         char_skip_score = 0
         query_chars = set(query_normalized.replace(' ', ''))
@@ -391,6 +355,10 @@ def advanced_fuzzy_search(query: str, limit: int = 15) -> List[Dict]:
             adv_phonetic * 0.07 +
             char_skip_score * 0.05
         )
+        
+        exact_match = title_normalized == query_normalized
+        starts_with = title_normalized.startswith(query_normalized)
+        contains = query_normalized in title_normalized
         
         if exact_match:
             final_score += 300
@@ -420,7 +388,8 @@ def advanced_fuzzy_search(query: str, limit: int = 15) -> List[Dict]:
     
     return results
 
-# --- Aiogram Handlers (Kept intact) ---
+# --- Aiogram Handlers ---
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     if message.from_user:
@@ -584,7 +553,6 @@ Example:
                 blocked_count += 1
             else:
                 failed_count += 1
-            print(f"Failed to send to {user_id}: {e}")
     
     summary = f"""✅ Broadcast Complete!
 
@@ -651,7 +619,10 @@ async def handle_search(message: Message):
         for result in results:
             try:
                 button_text = f"{result['title']} ({int(result['score'])}%)"
-                movie_idx = movies_cache.index([m for m in movies_cache if m['file_id'] == result['file_id']][0])
+                found_movie = next((m for m in movies_cache if m['file_id'] == result['file_id']), None)
+                if not found_movie: continue
+                movie_idx = movies_cache.index(found_movie)
+                
                 callback_data = f"movie_{movie_idx}"
                 keyboard_buttons.append([InlineKeyboardButton(text=button_text, callback_data=callback_data)])
             except (ValueError, IndexError):
@@ -704,7 +675,7 @@ async def send_movie(callback: types.CallbackQuery):
                 document=movie['file_id'],
                 caption=f"🎬 {movie['title']}"
             )
-        except Exception as doc_err:
+        except Exception:
             try:
                 await bot.send_video(
                     chat_id=callback.from_user.id,
@@ -712,7 +683,7 @@ async def send_movie(callback: types.CallbackQuery):
                     caption=f"🎬 {movie['title']}"
                 )
             except Exception as vid_err:
-                print(f"Error sending as document or video: {doc_err}, {vid_err}")
+                print(f"Error sending as document or video: {vid_err}")
                 await callback.answer("❌ Failed to send movie file")
                 return
         
@@ -734,72 +705,72 @@ async def send_movie(callback: types.CallbackQuery):
         except:
             pass
 
+# --- 24/7 Keep Alive (Ping) Function ---
 
-# =========================================================================
-# === WEB SERVER AND ENTRY POINT FOR KOYEB ===
-# =========================================================================
+def keep_alive():
+    """This function keeps the bot running 24/7 by self-pinging its URL."""
+    if not APP_URL:
+        print("⚠️ APP_URL not set. Skipping 24/7 keep-alive ping.")
+        return
 
-# 1. Dynamic Port Configuration (Fixes the TCP health check issue)
-WEB_SERVER_PORT = int(os.environ.get("PORT", 5000))
-WEB_SERVER_HOST = "0.0.0.0"
-WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
-# NOTE: Koyeb will provide the public URL, but you must set the webhook
-# using the full URL (e.g., https://your-koyeb-app.koyeb.app/webhook/TOKEN)
+    print(f"💡 Starting 24/7 keep-alive ping to {APP_URL} every {PING_INTERVAL_SECONDS} seconds.")
+    
+    # Set Webhook URL to Telegram
+    webhook_url = f"{APP_URL}/webhook/{BOT_TOKEN}"
+    try:
+        requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={webhook_url}", timeout=10)
+        print(f"✅ Webhook set successfully to: {webhook_url}")
+    except requests.exceptions.RequestException as e:
+        print(f"🔴 Webhook set failed: {e}")
+
+
+    while True:
+        time.sleep(PING_INTERVAL_SECONDS) 
+        try:
+            response = requests.get(APP_URL, timeout=10)
+            if response.status_code == 200:
+                print(f"🟢 Ping successful at {datetime.now().strftime('%H:%M:%S')}")
+            else:
+                print(f"🟡 Ping failed (Status: {response.status_code}) at {datetime.now().strftime('%H:%M:%S')}")
+        except requests.exceptions.RequestException as e:
+            print(f"🔴 Ping Error: {e}")
+
+# --- Flask App Initialization and Webhook/Health Check Routes ---
 
 app = Flask(__name__)
 
-@app.route("/")
-async def index():
-    """Koyeb health check endpoint and simple status."""
-    return f"Telegram Bot is alive and running on port {WEB_SERVER_PORT}."
-
-@app.route(WEBHOOK_PATH, methods=["POST"])
+# Webhook URL: /webhook/<BOT_TOKEN>
+@app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 async def telegram_webhook():
-    """Handles incoming updates from Telegram and feeds them to the Aiogram Dispatcher."""
     if request.headers.get("Content-Type") == "application/json":
-        update_data = request.json
-        update = types.Update(**update_data)
+        update = request.get_json()
         
-        # Use asyncio.run_coroutine_threadsafe to safely run the async dispatcher
-        # within Flask's non-async context (when using Gunicorn workers).
-        # We need a custom way to handle this since Flask is synchronous by default.
-        # Since gunicorn/gevent is often used, we use asyncio.run to execute the async part.
+        await dp.feed_raw_update(bot=bot, update=update)
         
-        try:
-            # We must run the async dispatcher synchronously here
-            asyncio.run(dp.feed_update(bot=bot, update=update))
-        except Exception as e:
-            print(f"Error feeding update to dispatcher: {e}")
-            # Still return 200 to Telegram to prevent re-sending updates
-            pass 
-        
-        return "", 200
-    else:
-        # Invalid request type
-        return abort(403)
+        return jsonify({"status": "ok"})
+    return jsonify({"status": "error", "message": "Invalid content type"}), 400
 
+# Health Check Route (Koyeb and Ping)
+@app.route("/", methods=["GET"])
+def index():
+    return "Bot is running!", 200
 
-def startup():
-    """Loads data and sets the webhook URL when the application starts."""
-    print("--- Starting Bot Setup ---")
+# --- Startup Logic (Executed by Gunicorn) ---
+
+if __name__ == "__main__":
+    print("Loading data...")
     load_movies()
     load_users()
     
-    # You MUST set the webhook URL manually on Koyeb after deployment
-    # because the exact public URL is unknown until deployment.
-    # To set the webhook, you can use a separate script or manually via a Telegram API call.
-    # For now, we only load data and let Gunicorn start the Flask server.
-    print(f"Bot ready with {len(movies_cache)} movies and {len(users_database)} users in memory")
-    print(f"Web server is configured to run Flask app 'app' via Gunicorn.")
-    print(f"Webhook path: {WEBHOOK_PATH}. Ensure you set the webhook URL in Telegram!")
-    print("--- Setup Complete ---")
-
-
-# Remove the old __main__ block (which only printed) and the lambda_handler.
-
-if __name__ == "__main__":
-    # This block is only for local testing with the built-in Flask server.
-    # Production (Koyeb) will use Gunicorn which calls startup() implicitly or runs 'app' directly.
-    startup()
-    print("--- Running local development server ---")
-    app.run(host=WEB_SERVER_HOST, port=WEB_SERVER_PORT, debug=True)
+    threading.Thread(target=keep_alive, daemon=True).start()
+    
+    print("Starting Flask app locally...")
+    app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 5000))) 
+    
+else:
+    print("Gunicorn starting: Loading data...")
+    load_movies()
+    load_users()
+    
+    threading.Thread(target=keep_alive, daemon=True).start()
+    print("Gunicorn ready.")
