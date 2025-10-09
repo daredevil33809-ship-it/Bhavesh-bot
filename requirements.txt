@@ -2,7 +2,7 @@ aiogram==3.22.0
 rapidfuzz==3.14.1
 python-Levenshtein==0.27.1
 boto3>=1.28.0
-​Flask
+​flask
 gunicorn
 requests
 gevent
