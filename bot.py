@@ -119,8 +119,6 @@ def save_movies():
     except Exception as e:
         logger.error(f"Error saving movies: {e}")
 
-# ... (Other loading/saving/indexing functions like build_movies_index, load_users, save_users, add_user, add_movie, normalize_abbreviations, phonetic_similarity, advanced_phonetic_match, check_rate_limit, check_user_membership, advanced_fuzzy_search remain the same) ...
-
 def build_movies_index():
     global movies_index
     movies_index = {}
@@ -675,6 +673,7 @@ async def telegram_webhook():
             update = types.Update.model_validate(update_data, context={"bot": bot})
             
             # FIX: Passed 'bot=bot' as required by aiogram v3+ for feed_update
+            # This is the line that solves the "missing 1 required positional argument" error
             await dp.feed_update(update, bot=bot)
             
             return "OK", 200
